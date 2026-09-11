@@ -1,0 +1,15 @@
+.env
+config/
+data/
+__pycache__/
+*.zip
+
+.env.*
+!.env.example
+*.log
+*.pem
+*.key
+*.pfx
+*.p12
+dist/
+.pytest_cache/

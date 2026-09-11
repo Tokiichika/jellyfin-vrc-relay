@@ -1,0 +1,33 @@
+services:
+  relay:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:18080:8080"
+    env_file: ./config/.env
+    volumes:
+      - cache:/data
+      - ./config:/config
+      - /proc/stat:/host/proc/stat:ro
+      - /proc/meminfo:/host/proc/meminfo:ro
+    environment:
+      HOST_PROC_PATH: /host/proc
+      SETTINGS_ENV_PATH: /config/.env
+    mem_limit: 384m
+    cpus: 1.5
+    pids_limit: 96
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+volumes:
+  cache:

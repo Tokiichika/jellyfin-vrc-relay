@@ -1,0 +1,16 @@
+.env
+config
+data
+__pycache__
+*.zip
+.git
+
+.env.*
+!.env.example
+*.log
+*.pem
+*.key
+*.pfx
+*.p12
+dist/
+.pytest_cache/
