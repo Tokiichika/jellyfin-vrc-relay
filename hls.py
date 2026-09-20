@@ -199,6 +199,8 @@ class HLS:
                 if not candidates:
                     raise HLSError('没有可用的本地电影媒体源；不支持直播或需要开启的远程源')
                 media = candidates[0]
+                if not title.strip():
+                    item['title'] = str(media.get('Name') or '视频').replace('\\', '/').rsplit('/', 1)[-1][:120]
                 item['media_source_id'] = media['Id']
                 item['duration'] = media['RunTimeTicks'] / 10000000
                 item['size'] = media.get('Size') or 0

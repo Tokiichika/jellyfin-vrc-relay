@@ -1,5 +1,6 @@
 """Shared Jellyfin HLS VOD / byte-range relay. Python standard library only."""
 import collections
+from email.message import Message
 import hashlib
 import html
 import hmac
@@ -106,7 +107,7 @@ class Cache:
         self.system_stats.snapshot()
         self.nas_config = NASConfig(self)
         self.update_settings({})  # migrate defaults/legacy bandwidth into .env once
-        self.debug.emit('INFO', 'startup', force=True, version='2.6.0', cache_bytes=self.used,
+        self.debug.emit('INFO', 'startup', force=True, version='2.7.0', cache_bytes=self.used,
                         cache_limit=self.budget, links=len(self.items), chunk_bytes=self.chunk)
 
     def validate_url(self, url):
@@ -177,6 +178,27 @@ class Cache:
         os.chmod(path, 0o600)
         path.replace(self.meta)
 
+    def remember_activity(self, key, event, title=''):
+        """Persist administrative actions, never infer watching from a copy."""
+        if event not in ('created', 'copied'):
+            raise ValueError('Unknown activity')
+        with self.lock:
+            if key not in self.items:
+                raise RelayError('播放链接已删除，请刷新列表')
+            previous = self.items[key]
+            field = 'last_' + event
+            stamp = max(time.time(), max((i.get(field, 0) for i in self.items.values()), default=0) + .000001)
+            updated = {**previous, field: stamp}
+            if event == 'created' and title.strip():
+                updated['title'] = title.strip()[:120]
+            self.items[key] = updated
+            try:
+                self.save()
+            except Exception:
+                self.items[key] = previous
+                raise
+            return {'id': key, 'title': updated['title'], field: stamp}
+
     def create(self, url, title):
         self.validate_url(url)
         with self.fetch_lock:
@@ -198,10 +220,14 @@ class Cache:
                 validator = etag if etag and not etag.startswith("W/") else modified
                 header = "ETag" if validator and validator == etag else "Last-Modified" if validator else ""
                 disposition = response.headers.get("Content-Disposition", "")
+                message = Message()
+                message['Content-Disposition'] = disposition
+                filename = message.get_filename() or ''
+                source_title = str(filename).replace('\\', '/').rsplit('/', 1)[-1][:120]
                 extension = re.search(r"\.(mp4|m4v|mkv|webm|avi|mov|ts)(?:[\"';\s]|$)", disposition, re.I)
                 ext = "." + extension.group(1).lower() if extension else mimetypes.guess_extension(content_type) or ".bin"
             key = secrets.token_urlsafe(24)
-            item = {"url": url, "title": title[:120] or "视频", "size": size,
+            item = {"url": url, "title": title[:120] or source_title or "视频", "size": size,
                     "type": content_type, "ext": ext, "validator": validator,
                     "validator_header": header, "created": int(time.time())}
             with self.lock:
@@ -313,6 +339,9 @@ class Cache:
                 mode = item.get('mode', 'file')
                 names = {name: length for name, length in self.entries.items() if name.startswith(key + '.')}
                 entry = {"id": key, "title": item['title'], "size": item['size'], 'mode': mode,
+                         'created': item.get('created', 0),
+                         'last_created': item.get('last_created', item.get('created', 0)),
+                         'last_copied': item.get('last_copied', 0),
                          'type': item['type'], 'cache_bytes': sum(names.values()),
                          'version_checked': bool(item.get('validator')),
                          'play_url': f"{base}/v/{key}/video{item['ext']}",
@@ -331,7 +360,8 @@ class Cache:
                                  cached_seconds=sum(s['duration'] for n, s in enumerate(item['segments']) if self.hls.filename(key, n) in names),
                                  session_state=self.session_state.get(key, '按需生成'))
                 items.append(entry)
-            return {"version": '2.6.0', 'defaults': defaults, 'system': system, 'bandwidth': self.bandwidth.snapshot(), "cache_bytes": self.used, "cache_limit": self.budget,
+            items.sort(key=lambda i: (i['last_created'], i['created'], i['id']), reverse=True)
+            return {"version": '2.7.0', 'defaults': defaults, 'system': system, 'bandwidth': self.bandwidth.snapshot(), "cache_bytes": self.used, "cache_limit": self.budget,
                     "hits": self.hits, "misses": self.misses, "upstream_bytes": self.upstream_bytes,
                     'metrics': {k: v for k, v in metrics.items() if k != 'per_item'},
                     'disk_free_bytes': shutil.disk_usage(self.root).free, "items": items}
@@ -519,7 +549,11 @@ class Handler(BaseHTTPRequestHandler):
                     key = self.server.cache.bili.create(url.strip(), title.strip())
                 else:
                     return self.reply(400, {'error': '未知播放模式'})
-                return self.reply(201, {"id": key})
+                activity = self.server.cache.remember_activity(key, 'created', title)
+                return self.reply(201, activity)
+            copied = re.fullmatch(r'/api/items/([A-Za-z0-9_-]{32})/copied', path)
+            if copied and self.command == 'POST':
+                return self.reply(200, self.server.cache.remember_activity(copied.group(1), 'copied'))
             match = re.fullmatch(r'/api/items/([A-Za-z0-9_-]{32})/stop', path)
             if match and self.command == 'POST':
                 with self.server.cache.fetch_lock:

@@ -14,3 +14,5 @@ __pycache__
 *.p12
 dist/
 .pytest_cache/
+
+.upgrade-backups/

@@ -4,6 +4,7 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
@@ -35,6 +36,8 @@ class Origin(BaseHTTPRequestHandler):
         self.send_header('Content-Range', f'bytes {start}-{end}/{len(DATA)}')
         self.send_header('Content-Type', 'video/mp4')
         self.send_header('ETag', self.server.etag)
+        if getattr(self.server, 'disposition', ''):
+            self.send_header('Content-Disposition', self.server.disposition)
         body = DATA[start:end + 1]
         if mode == 'truncate':
             body = body[:10]
@@ -72,6 +75,60 @@ class Tests(unittest.TestCase):
         if range_value:
             headers['Range'] = range_value
         return urlopen(Request(self.play, headers=headers, method=method), timeout=5)
+
+    def admin(self, path, body=None, token='x' * 32):
+        data = json.dumps(body).encode() if body is not None else None
+        return urlopen(Request(self.base + path, data=data,
+                              headers={'Authorization': 'Bearer ' + token,
+                                       'Content-Type': 'application/json'}), timeout=5)
+
+    def test_activity_auth_restart_and_repeated_creation(self):
+        endpoint = '/api/items/' + self.key + '/copied'
+        with self.assertRaises(HTTPError) as denied:
+            self.admin(endpoint, {}, token='wrong')
+        self.assertEqual(denied.exception.code, 401)
+        denied.exception.close()
+        self.assertNotIn('last_copied', self.cache.items[self.key])
+        with self.admin(endpoint, {}) as response:
+            copied = json.load(response)
+        with self.admin('/api/items', {'url': self.url, 'title': '第三集', 'mode': 'file'}) as response:
+            created = json.load(response)
+        self.assertEqual(created['id'], self.key)
+        self.assertEqual(self.origin.requests, 1)  # reused link, no extra origin request
+        restored = Cache(self.tmp.name, 2 * CHUNK, CHUNK, ['127.0.0.1'], allow_http=True)
+        item = restored.status('https://example.test')['items'][0]
+        self.assertEqual(item['title'], '第三集')
+        self.assertEqual(item['last_copied'], copied['last_copied'])
+        self.assertEqual(item['last_created'], created['last_created'])
+        self.assertNotIn('url', item)
+
+    def test_activity_order_legacy_and_delete(self):
+        second = self.cache.create(self.url.replace('a' * 32, 'b' * 32), '第四集')
+        legacy = self.cache.status('https://example.test')['items']
+        self.assertTrue(all(i['last_created'] == i['created'] and not i['last_copied'] for i in legacy))
+        self.cache.remember_activity(second, 'created')
+        self.cache.remember_activity(self.key, 'created')
+        self.assertEqual(self.cache.status('https://example.test')['items'][0]['id'], self.key)
+        first = self.cache.remember_activity(self.key, 'copied')
+        last = self.cache.remember_activity(second, 'copied')
+        self.assertGreater(last['last_copied'], first['last_copied'])
+        self.cache.delete(second)
+        with self.assertRaises(RelayError):
+            self.cache.remember_activity(second, 'copied')
+
+    def test_failed_activity_save_does_not_change_memory_or_disk(self):
+        original = self.cache.meta.read_bytes()
+        with patch.object(self.cache, 'save', side_effect=OSError('disk full')):
+            with self.assertRaises(OSError):
+                self.cache.remember_activity(self.key, 'created', 'should not survive')
+        self.assertEqual(self.cache.items[self.key]['title'], 'Test movie')
+        self.assertNotIn('last_created', self.cache.items[self.key])
+        self.assertEqual(self.cache.meta.read_bytes(), original)
+
+    def test_source_filename_title(self):
+        self.origin.disposition = "attachment; filename*=UTF-8''%E7%AC%AC%E4%B8%89%E9%9B%86.mp4"
+        key = self.cache.create(self.url.replace('a' * 32, 'c' * 32), '')
+        self.assertEqual(self.cache.items[key]['title'], '第三集.mp4')
 
     def test_concurrent_viewers_only_download_one_chunk(self):
         def viewer(_):

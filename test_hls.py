@@ -39,7 +39,7 @@ class Origin(BaseHTTPRequestHandler):
         query = parse_qs(p.query)
         self.server.calls.append((p.path, query))
         if p.path.endswith('PlaybackInfo'):
-            return self.reply(json.dumps({'MediaSources': [{'Id': 'source1', 'Size': 1234567,
+            return self.reply(json.dumps({'MediaSources': [{'Id': 'source1', 'Name': '示例剧集 S01E03', 'Size': 1234567,
                 'RunTimeTicks': 120000000, 'DefaultAudioStreamIndex': 1,
                 'MediaStreams': [{'Type': 'Video', 'Codec': 'hevc', 'Width': 1920, 'Height': 1080, 'Index': 0},
                                  {'Type': 'Audio', 'Codec': self.server.audio, 'Index': 1},
@@ -106,6 +106,10 @@ class HLSTests(unittest.TestCase):
     def segment(self, index=0, headers=None):
         with urlopen(Request(self.play + '/segment/' + str(index) + '.ts', headers=headers or {}), timeout=5) as response:
             return response.read()
+
+    def test_missing_title_uses_media_name(self):
+        key = self.cache.hls.create(self.url, '', bitrate=4000000)
+        self.assertEqual(self.cache.items[key]['title'], '示例剧集 S01E03')
 
     def test_default_profile_and_full_seekable_timeline(self):
         with urlopen(self.play + '/video.m3u8') as response:
