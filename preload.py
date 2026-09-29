@@ -57,6 +57,8 @@ class Preloader:
         if type(percent) not in (int, float) or not math.isfinite(percent) or not 1 <= percent <= 100:
             raise ValueError('preload percent must be 1..100')
         with self.cache.lock:
+            if self.cache.maintenance.is_set():
+                raise ValueError('正在清理数据，请稍后再预载')
             item = self.cache.items.get(key)
             if not item or item.get('mode') != 'hls':
                 raise ValueError('only HLS supports preload')

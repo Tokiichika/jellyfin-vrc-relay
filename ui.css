@@ -49,3 +49,5 @@ button{position:relative;background-image:radial-gradient(ellipse at var(--light
 .copy-badge{display:inline-block;padding:3px 10px;border-radius:99px;color:#d8f9e5;background:#335d46;border:1px solid #8bd3a9;font-size:12px;margin-bottom:8px}
 .activity-meta{margin-bottom:12px}#items article h2{overflow-wrap:anywhere}
 @media(max-width:580px){.recent-activity{grid-template-columns:1fr}}
+
+.library-toolbar{display:flex;align-items:center;gap:16px;margin-bottom:16px}.library-toolbar label{margin:0;white-space:nowrap}.library-toolbar select{max-width:260px}.library-controls{padding:18px;border:1px solid var(--line);border-radius:16px;margin-bottom:20px}.library-controls summary{cursor:pointer;color:var(--mint)}

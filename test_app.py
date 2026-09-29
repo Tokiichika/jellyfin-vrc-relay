@@ -130,6 +130,79 @@ class Tests(unittest.TestCase):
         key = self.cache.create(self.url.replace('a' * 32, 'c' * 32), '')
         self.assertEqual(self.cache.items[key]['title'], '第三集.mp4')
 
+    def control(self, operation):
+        with self.admin('/api/control', {'operation': operation, 'confirm': True}) as response:
+            return json.load(response)
+
+    def test_control_auth_confirmation_pause_resume_and_restart(self):
+        for token, body, expected in [('wrong', {'operation': 'kick', 'confirm': True}, 401),
+                                       ('x' * 32, {'operation': 'kick'}, 400)]:
+            with self.assertRaises(HTTPError) as error:
+                self.admin('/api/control', body, token=token)
+            self.assertEqual(error.exception.code, expected)
+            error.exception.close()
+        self.assertFalse(self.relay.playback_paused)
+        self.assertTrue(self.control('kick')['paused'])
+        with self.assertRaises(HTTPError) as error:
+            self.get('bytes=0-10')
+        self.assertEqual(error.exception.code, 503)
+        error.exception.close()
+        self.assertEqual(self.origin.requests, 1)
+        restarted = Server(('127.0.0.1', 0), self.cache, 'x' * 32, 'https://example.test')
+        try:
+            self.assertTrue(restarted.playback_paused)
+        finally:
+            restarted.server_close()
+        self.assertFalse(self.control('resume')['paused'])
+        with self.get('bytes=0-10') as response:
+            self.assertEqual(response.read(), DATA[:11])
+
+    def test_clear_cache_preserves_links_and_clear_library_invalidates(self):
+        self.cache.get_chunk(self.key, 0)
+        self.cache.remember_activity(self.key, 'copied')
+        old = self.cache.meta.read_bytes()
+        result = self.control('clear-cache')
+        self.assertGreater(result['removed_bytes'], 0)
+        self.assertEqual(self.cache.used, 0)
+        self.assertEqual(self.cache.meta.read_bytes(), old)
+        self.assertTrue(self.relay.playback_paused)
+        self.assertEqual(self.control('clear-library')['removed_links'], 1)
+        self.assertEqual(json.loads(self.cache.meta.read_text()), {})
+        self.control('resume')
+        with self.assertRaises(HTTPError) as error:
+            self.get('bytes=0-10')
+        self.assertEqual(error.exception.code, 404)
+        error.exception.close()
+
+    def test_clear_refuses_pinned_data_and_keeps_playback_paused(self):
+        self.cache.get_chunk(self.key, 0)
+        name = next(iter(self.cache.entries))
+        self.cache.pins[name] = 1
+        with self.assertRaises(RelayError):
+            self.relay.control('clear-library')
+        self.assertIn(self.key, self.cache.items)
+        self.assertTrue((self.cache.root / name).exists())
+        self.assertTrue(self.relay.playback_paused)
+        self.assertFalse(self.cache.maintenance.is_set())
+        self.cache.pins.clear()
+
+    def test_kick_cancels_active_throttled_stream(self):
+        entered = threading.Event()
+        def waiting(identity, size, cancelled=None):
+            entered.set()
+            if not cancelled.wait(5):
+                raise AssertionError('stream was not cancelled')
+            raise ConnectionAbortedError('kicked')
+        with patch.object(self.cache.bandwidth, 'acquire', side_effect=waiting):
+            response = self.get(None)
+            self.assertTrue(entered.wait(2))
+            self.assertEqual(self.control('kick')['disconnected_requests'], 1)
+            with self.relay.media_cv:
+                self.assertTrue(self.relay.media_cv.wait_for(lambda: not self.relay.media_requests, 3))
+            response.close()
+        self.assertEqual(self.cache.bandwidth.snapshot()['admitted_ips'], 0)
+        self.assertEqual(self.cache.metrics.snapshot()['active_requests'], 0)
+
     def test_concurrent_viewers_only_download_one_chunk(self):
         def viewer(_):
             with self.get('bytes=100-999') as response:

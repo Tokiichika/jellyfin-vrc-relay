@@ -67,6 +67,7 @@ class Cache:
             raise ValueError("Invalid cache/chunk limits")
         self.hosts, self.allow_http = set(hosts), allow_http
         self.lock = threading.RLock()
+        self.maintenance = threading.Event()
         self.pins = collections.Counter()
         self.metrics = Metrics()
         self.debug = Diagnostics()
@@ -107,7 +108,7 @@ class Cache:
         self.system_stats.snapshot()
         self.nas_config = NASConfig(self)
         self.update_settings({})  # migrate defaults/legacy bandwidth into .env once
-        self.debug.emit('INFO', 'startup', force=True, version='2.7.0', cache_bytes=self.used,
+        self.debug.emit('INFO', 'startup', force=True, version='2.8.0', cache_bytes=self.used,
                         cache_limit=self.budget, links=len(self.items), chunk_bytes=self.chunk)
 
     def validate_url(self, url):
@@ -361,7 +362,7 @@ class Cache:
                                  session_state=self.session_state.get(key, '按需生成'))
                 items.append(entry)
             items.sort(key=lambda i: (i['last_created'], i['created'], i['id']), reverse=True)
-            return {"version": '2.7.0', 'defaults': defaults, 'system': system, 'bandwidth': self.bandwidth.snapshot(), "cache_bytes": self.used, "cache_limit": self.budget,
+            return {"version": '2.8.0', 'defaults': defaults, 'system': system, 'bandwidth': self.bandwidth.snapshot(), "cache_bytes": self.used, "cache_limit": self.budget,
                     "hits": self.hits, "misses": self.misses, "upstream_bytes": self.upstream_bytes,
                     'metrics': {k: v for k, v in metrics.items() if k != 'per_item'},
                     'disk_free_bytes': shutil.disk_usage(self.root).free, "items": items}
@@ -373,10 +374,114 @@ class Server(ThreadingHTTPServer):
 
     def __init__(self, address, cache, token, base, clients=24):
         self.cache, self.token, self.base = cache, token, base
+        self.media_cv = threading.Condition()
+        self.media_requests = {}
+        self.playback_path = cache.root / 'playback.json'
+        self.playback_paused = False
+        if self.playback_path.exists():
+            value = json.loads(self.playback_path.read_text(encoding='utf-8'))['paused']
+            if type(value) is not bool:
+                raise ValueError('playback.json paused 必须是布尔值')
+            self.playback_paused = value
+        self.control_lock = threading.Lock()
         self.trusted = [ipaddress.ip_network(v.strip()) for v in os.environ.get(
             'TRUSTED_PROXY_CIDRS', '127.0.0.0/8,::1/128,172.16.0.0/12').split(',') if v.strip()]
         self.slots = threading.BoundedSemaphore(clients)
         super().__init__(address, Handler)
+
+    def playback_status(self):
+        with self.media_cv:
+            return {'paused': self.playback_paused, 'requests': len(self.media_requests),
+                    'maintenance': self.cache.maintenance.is_set()}
+
+    def set_playback_paused(self, value):
+        # Caller holds media_cv: admission changes only after successful persistence.
+        temporary = self.playback_path.with_suffix('.json.part')
+        temporary.write_text(json.dumps({'paused': value}), encoding='utf-8')
+        temporary.replace(self.playback_path)
+        self.playback_paused = value
+
+    def control(self, operation):
+        if operation not in ('kick', 'resume', 'clear-cache', 'clear-library'):
+            raise ValueError('未知管理操作')
+        if not self.control_lock.acquire(blocking=False):
+            raise RelayError('已有管理操作正在执行，请稍后重试')
+        try:
+            if operation == 'resume':
+                with self.media_cv:
+                    self.set_playback_paused(False)
+                return self.playback_status()
+            with self.media_cv:
+                self.set_playback_paused(True)
+                requests = list(self.media_requests.items())
+                for handler, cancelled in requests:
+                    cancelled.set()
+                    try:
+                        handler.connection.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+            if operation == 'kick':
+                self.finish_media(None)
+                return {**self.playback_status(), 'disconnected_requests': len(requests)}
+            cache = self.cache
+            cache.maintenance.set()
+            with cache.lock:
+                for key in list(cache.preloader.jobs):
+                    cache.preloader.cancel(key)
+                worker = cache.preloader.worker
+            if worker is not None:
+                worker.join(timeout=10)
+                if worker.is_alive():
+                    raise RelayError('预载仍在结束当前回源；播放已暂停，尚未删除数据，请稍后重试清理')
+            with self.media_cv:
+                if not self.media_cv.wait_for(lambda: not self.media_requests, timeout=10):
+                    raise RelayError('视频请求仍在结束回源；播放已暂停，尚未删除数据，请稍后重试清理')
+            if not cache.fetch_lock.acquire(blocking=False):
+                raise RelayError('仍有源站操作；播放已暂停，尚未删除数据，请稍后重试清理')
+            try:
+                with cache.lock:
+                    if any(cache.pins.values()):
+                        raise RelayError('缓存仍被使用；播放已暂停，请稍后重试')
+                    keys = list(cache.items)
+                if operation == 'clear-library':
+                    for key in list(cache.hls.active):
+                        cache.hls.stop(key)
+                with cache.lock:
+                    if operation == 'clear-library':
+                        previous = cache.items
+                        cache.items = {}
+                        try:
+                            cache.save()
+                        except Exception:
+                            cache.items = previous
+                            raise
+                    removed = 0
+                    for name in list(cache.entries):
+                        (cache.root / name).unlink(missing_ok=True)
+                        removed += cache.entries[name]
+                        cache.used -= cache.entries.pop(name)
+                    cache.preloader.jobs.clear()
+                    if operation == 'clear-library':
+                        cache.session_state.clear()
+                        for key in keys:
+                            cache.metrics.forget(key)
+                return {**self.playback_status(), 'removed_bytes': removed,
+                        'removed_links': len(keys) if operation == 'clear-library' else 0}
+            finally:
+                cache.fetch_lock.release()
+        finally:
+            self.cache.maintenance.clear()
+            self.control_lock.release()
+
+    def finish_media(self, handler):
+        with self.media_cv:
+            self.media_requests.pop(handler, None)
+            if self.playback_paused and not self.media_requests:
+                with self.cache.bandwidth.cv:
+                    self.cache.bandwidth.leases.clear()
+                with self.cache.metrics.lock:
+                    self.cache.metrics.clients.clear()
+            self.media_cv.notify_all()
 
     def process_request(self, request, address):
         if not self.slots.acquire(blocking=False):
@@ -457,6 +562,16 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/"):
             if not self.authorized():
                 return self.reply(401, {"error": "管理密钥不正确"})
+            if path == '/api/control' and self.command == 'POST':
+                length = int(self.headers.get('Content-Length', '0'))
+                if not 0 < length <= 256 or self.headers.get('Transfer-Encoding'):
+                    return self.reply(400, {'error': '管理操作请求无效'})
+                body = json.loads(self.rfile.read(length))
+                if body.get('confirm') is not True:
+                    return self.reply(400, {'error': '请确认操作影响后再执行'})
+                return self.reply(200, self.server.control(body.get('operation')))
+            if self.command in ('POST', 'DELETE') and self.server.cache.maintenance.is_set():
+                return self.reply(503, {'error': '正在清理数据，请稍后再操作'})
             if path in ('/api/settings', '/api/nas-config'):
                 cache = self.server.cache
                 if self.command == 'GET':
@@ -520,7 +635,8 @@ class Handler(BaseHTTPRequestHandler):
                     self.server.cache.update_settings({'DEBUG_ENABLED': enabled})
                     return self.reply(200, self.server.cache.debug.snapshot())
             if path == "/api/items" and self.command == "GET":
-                return self.reply(200, self.server.cache.status(self.server.base))
+                return self.reply(200, {**self.server.cache.status(self.server.base),
+                                        'playback': self.server.playback_status()})
             variant = re.fullmatch(r'/api/items/([A-Za-z0-9_-]{32})/variant', path)
             if (path == "/api/items" or variant) and self.command == "POST":
                 length = int(self.headers.get("Content-Length", "0"))
@@ -613,7 +729,7 @@ class Handler(BaseHTTPRequestHandler):
             self.throttled = True
         for offset in range(0, len(data), 65536):
             part = data[offset:offset + 65536]
-            self.server.cache.bandwidth.acquire(self.limit_identity, len(part))
+            self.server.cache.bandwidth.acquire(self.limit_identity, len(part), getattr(self, 'media_cancelled', None))
             self.wfile.write(part)
             self.wfile.flush()
             self.media_bytes += len(part)
@@ -722,7 +838,15 @@ class Handler(BaseHTTPRequestHandler):
         self.request_started = time.monotonic()
         self.media_bytes, self.first_byte, self.media_aborted = 0, None, False
         self.response_status = None
+        self.media_cancelled = threading.Event()
+        registered = False
         try:
+            if urlsplit(self.path).path.startswith('/v/'):
+                with self.server.media_cv:
+                    if self.server.playback_paused:
+                        return self.reply(503, {'error': '管理员已暂停播放，请等待恢复'})
+                    self.server.media_requests[self] = self.media_cancelled
+                    registered = True
             self.dispatch()
         except SettingsError as error:
             self.reply(400, {'error': str(error)})
@@ -734,7 +858,7 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, TypeError, AttributeError) as error:
             self.server.cache.debug.exception('invalid_request', error, self.media_key)
             self.reply(400, {"error": "请求格式错误"})
-        except (BrokenPipeError, ConnectionResetError, socket.timeout):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, socket.timeout):
             self.media_aborted = True
             self.server.cache.debug.emit('DEBUG', 'client_disconnected_or_timeout', self.media_key)
             self.close_connection = True
@@ -746,6 +870,8 @@ class Handler(BaseHTTPRequestHandler):
             self.server.cache.metrics.error(self.media_key, '服务内部异常，请查看调试日志中的类型和代码位置')
             self.reply(500, {'error': '服务内部异常，请查看调试日志中的类型和代码位置'})
         finally:
+            if registered:
+                self.server.finish_media(self)
             if self.media_key:
                 self.server.cache.debug.emit('INFO', 'media_response_finished', self.media_key,
                     status=self.response_status, bytes=self.media_bytes, first_byte_seconds=self.first_byte,

@@ -113,11 +113,13 @@ class Bandwidth:
                 del self.clients[identity]
             self.cv.notify_all()
 
-    def acquire(self, identity, size):
+    def acquire(self, identity, size, cancelled=None):
         if not 0 <= size <= 65536:
             raise ValueError('write exceeds bucket size')
         with self.cv:
             while True:
+                if cancelled is not None and cancelled.is_set():
+                    raise ConnectionAbortedError('播放请求已由管理员清退')
                 self.refill()
                 client = self.clients[identity]
                 if min(self.tokens, client['tokens']) >= size:
@@ -125,7 +127,7 @@ class Bandwidth:
                     client['tokens'] -= size
                     return
                 total, per = self.rates()
-                self.cv.wait(max(.001, (size - self.tokens) / total, (size - client['tokens']) / per))
+                self.cv.wait(min(.25, max(.001, (size - self.tokens) / total, (size - client['tokens']) / per)))
 
     def snapshot(self):
         with self.cv:
