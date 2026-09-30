@@ -23,6 +23,7 @@ from hls import HLS, HLSError
 from metrics import Metrics
 from diagnostics import Diagnostics
 from throttle import Bandwidth
+from live import Live, LIVE_BW
 from preload import FetchGate, Preloader
 from bili import Bili, BiliError
 from system_stats import SystemStats
@@ -107,8 +108,9 @@ class Cache:
         self.system_stats = SystemStats()
         self.system_stats.snapshot()
         self.nas_config = NASConfig(self)
+        self.live = Live(self)
         self.update_settings({})  # migrate defaults/legacy bandwidth into .env once
-        self.debug.emit('INFO', 'startup', force=True, version='2.8.0', cache_bytes=self.used,
+        self.debug.emit('INFO', 'startup', force=True, version='2.9.0', cache_bytes=self.used,
                         cache_limit=self.budget, links=len(self.items), chunk_bytes=self.chunk)
 
     def validate_url(self, url):
@@ -135,7 +137,8 @@ class Cache:
                 protected = sum(size for name, size in self.entries.items() if self.pins[name])
                 if protected > limit:
                     raise SettingsError('正在读取或预载的缓存超过新上限，请稍后重试或先取消预载')
-                self.bandwidth.configure(bw, persist=lambda: self.settings.save(values, revision))
+                self.live.bandwidth.configure({k: values[v] for k, v in LIVE_BW.items()},
+                    persist=lambda: self.bandwidth.configure(bw, persist=lambda: self.settings.save(values, revision)))
                 self.budget = limit
                 self.evict(0)
             self.hls.timeout = int(values['HLS_TIMEOUT_SECONDS'])
@@ -353,7 +356,7 @@ class Cache:
                 if mode == 'hls':
                     entry.update({k: item.get(k) for k in ('duration', 'source_video', 'source_audio',
                                  'source_resolution', 'output_video', 'output_audio', 'height', 'bitrate',
-                                 'audio_bitrate', 'transcode_video', 'transcode_audio',
+                                 'audio_bitrate', 'transcode_video', 'transcode_audio', 'video_codec',
                                  'subtitle_index', 'subtitle_title', 'subtitles')})
                     entry['preload'] = self.preloader.snapshot(key)
                     entry.update(segments_total=len(item['segments']),
@@ -362,7 +365,7 @@ class Cache:
                                  session_state=self.session_state.get(key, '按需生成'))
                 items.append(entry)
             items.sort(key=lambda i: (i['last_created'], i['created'], i['id']), reverse=True)
-            return {"version": '2.8.0', 'defaults': defaults, 'system': system, 'bandwidth': self.bandwidth.snapshot(), "cache_bytes": self.used, "cache_limit": self.budget,
+            return {"version": '2.9.0', 'defaults': defaults, 'system': system, 'bandwidth': self.bandwidth.snapshot(), "cache_bytes": self.used, "cache_limit": self.budget,
                     "hits": self.hits, "misses": self.misses, "upstream_bytes": self.upstream_bytes,
                     'metrics': {k: v for k, v in metrics.items() if k != 'per_item'},
                     'disk_free_bytes': shutil.disk_usage(self.root).free, "items": items}
@@ -386,7 +389,9 @@ class Server(ThreadingHTTPServer):
         self.control_lock = threading.Lock()
         self.trusted = [ipaddress.ip_network(v.strip()) for v in os.environ.get(
             'TRUSTED_PROXY_CIDRS', '127.0.0.0/8,::1/128,172.16.0.0/12').split(',') if v.strip()]
-        self.slots = threading.BoundedSemaphore(clients)
+        # Leave room for administration and MediaMTX auth when VOD is saturated.
+        self.max_media = clients
+        self.slots = threading.BoundedSemaphore(clients + 8)
         super().__init__(address, Handler)
 
     def playback_status(self):
@@ -548,7 +553,7 @@ class Handler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path == "/health" and self.command in ("GET", "HEAD"):
             return self.reply(200, {"ok": True})
-        if path in ('/ui.css', '/ui.js', '/settings-app.js') and self.command in ('GET', 'HEAD'):
+        if path in ('/ui.css', '/ui.js', '/settings-app.js', '/live-app.js') and self.command in ('GET', 'HEAD'):
             asset = Path(__file__).with_name(path[1:])
             content_type = 'text/css; charset=utf-8' if path.endswith('.css') else 'text/javascript; charset=utf-8'
             return self.reply(200, asset.read_bytes(), content_type)
@@ -559,9 +564,30 @@ class Handler(BaseHTTPRequestHandler):
             page = page.replace('__FOOTER_ICP__', html.escape(values['FOOTER_ICP']))
             page = page.replace('__FOOTER_NOTICE__', html.escape(values['FOOTER_NOTICE']).replace('\n', '<br>'))
             return self.reply(200, page.encode(), "text/html; charset=utf-8")
+        if path.startswith('/internal/live/'):
+            live = self.server.cache.live
+            if self.command != 'POST' or len(live.secret) < 32 or not hmac.compare_digest(path.encode(), ('/internal/live/' + live.secret).encode()):
+                return self.reply(403, {'error': 'Forbidden'})
+            length = int(self.headers.get('Content-Length', '0'))
+            if not 0 < length <= 8192 or self.headers.get('Transfer-Encoding'):
+                return self.reply(400, {'error': 'Invalid request'})
+            allowed = live.authenticate(json.loads(self.rfile.read(length)))
+            return self.reply(200 if allowed else 403, {'ok': allowed})
         if path.startswith("/api/"):
             if not self.authorized():
                 return self.reply(401, {"error": "管理密钥不正确"})
+            if path == '/api/live':
+                if self.command == 'GET':
+                    return self.reply(200, self.server.cache.live.snapshot(self.server.base))
+                if self.command == 'POST':
+                    length = int(self.headers.get('Content-Length', '0'))
+                    if not 0 < length <= 2048 or self.headers.get('Transfer-Encoding'):
+                        return self.reply(400, {'error': '直播操作请求无效'})
+                    try:
+                        result = self.server.cache.live.control(json.loads(self.rfile.read(length)))
+                    except ValueError as error:
+                        return self.reply(400, {'error': str(error)})
+                    return self.reply(200, result)
             if path == '/api/control' and self.command == 'POST':
                 length = int(self.headers.get('Content-Length', '0'))
                 if not 0 < length <= 256 or self.headers.get('Transfer-Encoding'):
@@ -658,7 +684,8 @@ class Handler(BaseHTTPRequestHandler):
                     key = self.server.cache.hls.create(url.strip(), title.strip(),
                         body.get('height', defaults['DEFAULT_HEIGHT']), body.get('bitrate', defaults['DEFAULT_VIDEO_BITRATE']),
                         body.get('transcode_video', defaults['DEFAULT_TRANSCODE_VIDEO']), body.get('transcode_audio', defaults['DEFAULT_TRANSCODE_AUDIO']),
-                        body.get('audio_bitrate', defaults['DEFAULT_AUDIO_BITRATE']), body.get('subtitle_index', -1))
+                        body.get('audio_bitrate', defaults['DEFAULT_AUDIO_BITRATE']), body.get('subtitle_index', -1),
+                        body.get('video_codec', defaults['DEFAULT_VIDEO_CODEC']))
                 elif mode == 'file':
                     key = self.server.cache.create(url.strip(), title.strip())
                 elif mode == 'bilibili':
@@ -845,6 +872,8 @@ class Handler(BaseHTTPRequestHandler):
                 with self.server.media_cv:
                     if self.server.playback_paused:
                         return self.reply(503, {'error': '管理员已暂停播放，请等待恢复'})
+                    if len(self.server.media_requests) >= self.server.max_media:
+                        return self.reply(503, {'error': '点播连接已满，请稍后重试'})
                     self.server.media_requests[self] = self.media_cancelled
                     registered = True
             self.dispatch()
@@ -901,4 +930,5 @@ if __name__ == "__main__":
             time.sleep(15)
             cache.hls.reap()
     threading.Thread(target=maintenance, daemon=True).start()
+    cache.live.start()
     server.serve_forever()

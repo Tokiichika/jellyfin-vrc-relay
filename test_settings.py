@@ -84,9 +84,10 @@ class ConfigTests(unittest.TestCase):
         cache = Cache(root, 1000000, 65536, ['jellyfin.example.com'])
         self.assertEqual(cache.bandwidth.snapshot()['effective_total_mbps'], 80)
         cache.update_settings({'REFRESH_SECONDS': 7, 'DEFAULT_HEIGHT': 720, 'HLS_IDLE_SECONDS': 180,
-                               'DEBUG_ENABLED': True, 'BANDWIDTH_TOTAL_MBPS': 150})
+                               'DEBUG_ENABLED': True, 'BANDWIDTH_TOTAL_MBPS': 150, 'DEFAULT_VIDEO_CODEC': 'hevc'})
         restarted = Cache(root, 1000000, 65536, ['jellyfin.example.com'])
         self.assertEqual(restarted.settings.values['REFRESH_SECONDS'], 7)
+        self.assertEqual(restarted.settings.values['DEFAULT_VIDEO_CODEC'], 'hevc')
         self.assertEqual(restarted.hls.idle, 180)
         self.assertTrue(restarted.debug.enabled)
         self.assertEqual(restarted.bandwidth.snapshot()['effective_total_mbps'], 120)
@@ -102,7 +103,7 @@ class ConfigTests(unittest.TestCase):
 
     def test_protected_keys_stale_revision_and_invalid_origin(self):
         for values in ({'ADMIN_TOKEN': 'new'}, {'NAS_ORIGIN': 'https://evil.example'},
-                       {'BANDWIDTH_CLIENT_MBPS': 9}, {'REFRESH_SECONDS': 0}):
+                       {'BANDWIDTH_CLIENT_MBPS': 9}, {'REFRESH_SECONDS': 0}, {'DEFAULT_VIDEO_CODEC': 'av1'}):
             with self.assertRaises(SettingsError):
                 self.cache.update_settings(values)
         old = self.cache.settings.revision()

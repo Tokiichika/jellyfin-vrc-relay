@@ -1,4 +1,4 @@
-"""Apply 2.8.0 to a compatible 2.5.1/2.6.x/2.7.x/2.8.x deployment."""
+"""Apply 2.9.0 to a compatible 2.5.1/2.6.x/2.7.x/2.8.x/2.9.x deployment."""
 import ast
 import argparse
 from datetime import datetime
@@ -10,6 +10,7 @@ import subprocess
 import sys
 
 FILES = (
+    'compose.sh', 'live.py', 'live_gateway.py', 'live-app.js', 'live_setup.py', 'compose.live.yaml', 'LIVE.md',
     'app.py', 'hls.py', 'metrics.py', 'diagnostics.py', 'throttle.py',
     'preload.py', 'bili.py', 'mp4.py', 'system_stats.py', 'settings.py',
     'nas_config.py', 'index.html', 'ui.css', 'ui.js', 'settings-app.js',
@@ -42,8 +43,8 @@ def deployment_version(target):
     if len(versions) != 1:
         raise ValueError('app.py 版本标识缺失或不一致：' + (', '.join(sorted(versions)) or '未识别') + '；请核对原部署目录。')
     version = versions.pop()
-    if version != '2.5.1' and not re.fullmatch(r'2\.(6|7|8)\.\d+', version):
-        raise ValueError(f'检测到 app.py 版本 {version}；当前支持 2.5.1、2.6.x、2.7.x/2.8.x。')
+    if version != '2.5.1' and not re.fullmatch(r'2\.(6|7|8|9)\.\d+', version):
+        raise ValueError(f'检测到 app.py 版本 {version}；当前支持 2.5.1、2.6.x、2.7.x/2.8.x/2.9.x。')
     return version
 
 
@@ -87,7 +88,7 @@ def apply(source, target):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='升级到 2.8.0，保留原配置、Compose 项目和缓存卷')
+    parser = argparse.ArgumentParser(description='升级到 2.9.0，保留原配置、Compose 项目和缓存卷')
     parser.add_argument('target', help='原部署目录的绝对路径，例如 /opt/jellyfin-vrc-relay')
     args = parser.parse_args()
     if not sys.platform.startswith('linux') or os.geteuid() != 0:
@@ -104,7 +105,7 @@ def main():
     print('保留 compose.yaml、反向代理配置、管理密钥和缓存卷；正在重建原服务。', flush=True)
     # Invoke from the original directory to preserve the Compose project/volume name.
     subprocess.run([sys.executable, str(target / 'deploy.py'), '--non-interactive'], cwd=target, check=True)
-    print('2.8.0 更新完成。浏览器刷新后即可使用最近创建 / 最近复制记录。')
+    print('2.9.0 更新完成。请放行直播 TCP 端口，并在管理页测试 OBS 推流及 VRC 观看。')
 
 
 if __name__ == '__main__':

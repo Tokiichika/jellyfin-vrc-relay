@@ -69,7 +69,7 @@ class Features(unittest.TestCase):
         self.assertEqual(tracks[0]['index'], 2)
         self.assertTrue(tracks[0]['external'])
         self.assertNotIn('Path', tracks[0])
-        key = self.cache.hls.create(self.fixture.url, 'subbed', transcode_video=False, subtitle_index=2)
+        key = self.cache.hls.create(self.fixture.url, 'subbed', subtitle_index=2)
         self.assertNotEqual(key, self.fixture.key)
         params = self.fixture.origin.parameters
         self.assertEqual(params['SubtitleMethod'], ['Encode'])
@@ -80,6 +80,26 @@ class Features(unittest.TestCase):
         self.assertNotIn('test-only-secret', json.dumps(self.cache.status('https://example.com')))
         with self.assertRaises(HLSError):
             self.cache.hls.create(self.fixture.url, 'bad', subtitle_index=99)
+
+    def test_subtitle_requires_explicit_reencoding_and_keeps_selected_codec(self):
+        before = len(self.fixture.origin.calls), len(self.cache.items)
+        for transcode in (False, None, 'false'):
+            with self.subTest(transcode=transcode), self.assertRaises(HLSError):
+                self.cache.hls.create(self.fixture.url, 'subbed', transcode_video=transcode,
+                                      subtitle_index=2, video_codec='hevc')
+        self.assertEqual(before, (len(self.fixture.origin.calls), len(self.cache.items)))
+        key = self.api('/api/items', {'mode': 'hls', 'url': self.fixture.url,
+                       'transcode_video': True, 'subtitle_index': 2, 'video_codec': 'hevc'})['id']
+        params = self.fixture.origin.parameters
+        self.assertEqual(params['VideoCodec'], ['hevc'])
+        self.assertEqual(params['SubtitleMethod'], ['Encode'])
+        self.assertEqual(params['AllowVideoStreamCopy'], ['false'])
+        self.assertEqual(self.cache.items[key]['output_video'], 'hevc')
+        with self.assertRaises(HTTPError) as caught:
+            self.api('/api/items', {'mode': 'hls', 'url': self.fixture.url,
+                     'transcode_video': False, 'subtitle_index': 2, 'video_codec': 'hevc'})
+        self.assertIn('烧录字幕需要重新编码', json.load(caught.exception)['error'])
+        caught.exception.close()
 
     def test_api_auth_and_bandwidth_persistence(self):
         for path, body in [('/api/bandwidth', {}), ('/api/subtitles', {'id': self.fixture.key}),

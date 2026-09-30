@@ -161,25 +161,32 @@ class HLS:
         return self.subtitle_tracks(media)
 
     def create(self, url, title, height=1080, bitrate=8000000, transcode_video=True,
-               transcode_audio=True, audio_bitrate=192000, subtitle_index=-1):
+               transcode_audio=True, audio_bitrate=192000, subtitle_index=-1, video_codec='h264'):
         self.cache.validate_url(url)
         if type(subtitle_index) is not int or not -1 <= subtitle_index <= 10000:
             raise HLSError('字幕轨道无效')
-        if subtitle_index >= 0:
-            transcode_video = True
         if (type(height) is not int or height not in (720, 1080, 2160)
                 or type(bitrate) is not int or not 500000 <= bitrate <= 20000000
                 or type(audio_bitrate) is not int or not 64000 <= audio_bitrate <= 512000
                 or type(transcode_video) is not bool or type(transcode_audio) is not bool):
             raise HLSError('请选择受支持的分辨率和码率')
+        if not isinstance(video_codec, str) or video_codec not in ('h264', 'hevc'):
+            raise HLSError('视频重新编码仅支持 H.264 或 HEVC（H.265）')
+        if subtitle_index >= 0 and not transcode_video:
+            raise HLSError('烧录字幕需要重新编码视频；请勾选“是否重新编码”，或选择“不烧录字幕”')
         self.cache.debug.emit('INFO', 'hls_create_requested', height=height, bitrate=bitrate,
-                              transcode_video=transcode_video, transcode_audio=transcode_audio, audio_bitrate=audio_bitrate)
+                              transcode_video=transcode_video, video_codec=video_codec,
+                              transcode_audio=transcode_audio, audio_bitrate=audio_bitrate)
         options = dict(height=height, bitrate=bitrate, transcode_video=transcode_video,
-                       transcode_audio=transcode_audio, audio_bitrate=audio_bitrate, subtitle_index=subtitle_index)
+                       transcode_audio=transcode_audio, audio_bitrate=audio_bitrate,
+                       subtitle_index=subtitle_index, video_codec=video_codec)
+        legacy_defaults = {'subtitle_index': -1, 'video_codec': 'h264'}
         with self.cache.fetch_lock:
             with self.cache.lock:
                 for key, existing in self.cache.items.items():
-                    if existing.get('mode') == 'hls' and existing['url'] == url and all(existing.get(k, -1 if k == 'subtitle_index' else None) == v for k, v in options.items()):
+                    if existing.get('mode') == 'hls' and existing['url'] == url and all(
+                            k == 'video_codec' and not transcode_video
+                            or existing.get(k, legacy_defaults.get(k)) == v for k, v in options.items()):
                         return key
                 if len(self.cache.items) >= 100:
                     raise HLSError('最多保留 100 个链接，请删除旧链接')
@@ -222,14 +229,14 @@ class HLS:
                     video=item['source_video'] if re.fullmatch('[a-zA-Z0-9_]{1,32}', item['source_video']) else 'unknown',
                     audio=item['source_audio'] if re.fullmatch('[a-zA-Z0-9_]{1,32}', item['source_audio']) else 'unknown')
                 if not transcode_video and video.get('Codec') not in ('h264', 'hevc'):
-                    raise HLSError('保留视频目前仅支持 H.264/HEVC；请启用 H.264 转换')
+                    raise HLSError('保留视频目前仅支持 H.264/HEVC；请启用视频重新编码')
                 if audio and not transcode_audio and audio.get('Codec') not in ('aac', 'ac3', 'eac3', 'mp3', 'mp2'):
                     raise HLSError('该音频（如 FLAC）不支持当前 TS 分片直拷贝；请启用 AAC，或选择原文件模式')
-                item['output_video'] = 'h264' if transcode_video else video['Codec']
+                item['output_video'] = video_codec if transcode_video else video['Codec']
                 item['output_audio'] = ('aac' if transcode_audio else audio['Codec']) if audio else '无音轨'
                 params = {'MediaSourceId': item['media_source_id'], 'DeviceId': item['device_id'],
                           'PlaySessionId': item['session_id'], 'Static': 'false',
-                          'VideoCodec': 'h264' if transcode_video else 'copy',
+                          'VideoCodec': video_codec if transcode_video else 'copy',
                           'AudioCodec': 'aac' if transcode_audio else 'copy',
                           'AllowVideoStreamCopy': str(not transcode_video).lower(),
                           'AllowAudioStreamCopy': str(not transcode_audio).lower(), 'EnableAutoStreamCopy': 'false',

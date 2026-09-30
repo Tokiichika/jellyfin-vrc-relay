@@ -217,6 +217,52 @@ class HLSTests(unittest.TestCase):
         with self.assertRaises(HLSError):
             self.cache.hls.create(self.url, '', bitrate=999999999)
 
+    def test_hevc_reencoding_isolated_from_h264_and_persisted(self):
+        key = self.cache.hls.create(self.url, 'HEVC output', video_codec='hevc')
+        self.assertNotEqual(key, self.key)
+        p = self.origin.parameters
+        self.assertEqual(p['VideoCodec'], ['hevc'])
+        self.assertEqual(p['AllowVideoStreamCopy'], ['false'])
+        self.assertEqual(p['MaxVideoBitDepth'], ['8'])
+        self.assertEqual(p['VideoBitRate'], ['8000000'])
+        self.assertEqual(self.cache.items[key]['output_video'], 'hevc')
+        self.assertEqual(self.cache.hls.create(self.url, '', video_codec='hevc'), key)
+        restarted = Cache(self.tmp.name, self.cache.budget, 65536, ['127.0.0.1'], allow_http=True)
+        self.assertEqual(restarted.items[key]['video_codec'], 'hevc')
+        self.assertIn('VideoCodec=hevc', restarted.items[key]['segments'][0]['url'])
+        with restarted.hls.segment(key, 0) as (file, size):
+            self.assertEqual(file.read(), SEGMENT)
+
+    def test_legacy_h264_links_reused_and_copy_ignores_target_codec(self):
+        self.cache.items[self.key].pop('video_codec')
+        self.assertEqual(self.cache.hls.create(self.url, ''), self.key)
+        key = self.cache.hls.create(self.url, 'Copy', transcode_video=False, video_codec='hevc')
+        self.assertEqual(self.origin.parameters['VideoCodec'], ['copy'])
+        self.assertEqual(self.cache.items[key]['output_video'], 'hevc')
+        self.assertNotIn('VideoBitRate', self.origin.parameters)
+        self.assertEqual(self.cache.hls.create(self.url, '', transcode_video=False, video_codec='h264'), key)
+
+    def test_invalid_video_codecs_rejected_before_origin_request(self):
+        before = len(self.origin.calls), len(self.cache.items)
+        for codec in ('av1', 'h265', '', None, True, ['hevc']):
+            with self.subTest(codec=codec), self.assertRaises(HLSError):
+                self.cache.hls.create(self.url, '', video_codec=codec)
+        self.assertEqual(before, (len(self.origin.calls), len(self.cache.items)))
+
+    def test_video_codec_api_create_variant_and_configured_default(self):
+        headers = {'Authorization': 'Bearer ' + 'x' * 32, 'Content-Type': 'application/json'}
+        def post(path, body):
+            with urlopen(Request(self.base + path, headers=headers, data=json.dumps(body).encode())) as response:
+                return json.load(response)
+        key = post('/api/items', {'mode': 'hls', 'url': self.url, 'video_codec': 'hevc'})['id']
+        entry = next(item for item in self.cache.status('https://example.com')['items'] if item['id'] == key)
+        self.assertEqual((entry['video_codec'], entry['output_video']), ('hevc', 'hevc'))
+        variant = post('/api/items/' + key + '/variant', {'mode': 'hls', 'video_codec': 'h264'})['id']
+        self.assertEqual(variant, self.key)
+        self.assertEqual(self.cache.items[key]['output_video'], 'hevc')
+        self.cache.update_settings({'DEFAULT_VIDEO_CODEC': 'hevc'})
+        self.assertEqual(post('/api/items', {'mode': 'hls', 'url': self.url})['id'], key)
+
     def test_unsafe_playlist_rejected(self):
         item = self.cache.items[self.key]
         prefix = '#EXTM3U\n#EXTINF:12,\n'

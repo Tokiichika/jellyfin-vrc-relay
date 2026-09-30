@@ -118,6 +118,8 @@ def set_permissions(path):
 
 
 def command(args, root, capture=False):
+    from live_setup import compose_args
+    args = compose_args(args, root)
     try:
         return subprocess.run(args, cwd=root, check=True, text=True, capture_output=capture)
     except FileNotFoundError:
@@ -129,7 +131,7 @@ def command(args, root, capture=False):
 def wait_healthy(root, timeout=90):
     container = command(['docker', 'compose', 'ps', '-q', 'relay'], root, True).stdout.strip()
     if not container or '\n' in container:
-        raise DeployError('无法确认 relay 容器；请运行 docker compose ps 检查')
+        raise DeployError('无法确认 relay 容器；请运行 bash compose.sh ps 检查')
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         status = command(['docker', 'inspect', '--format', '{{.State.Health.Status}}', container], root, True).stdout.strip()
@@ -138,7 +140,7 @@ def wait_healthy(root, timeout=90):
         if status == 'unhealthy':
             break
         time.sleep(2)
-    raise DeployError('容器未通过健康检查，请运行 docker compose logs --tail=100 relay；配置和缓存已保留')
+    raise DeployError('容器未通过健康检查，请运行 bash compose.sh logs --tail=100 relay mediamtx；配置和缓存已保留')
 
 
 def main():
@@ -156,18 +158,38 @@ def main():
         command(['docker', 'version'], root, True)
         command(['docker', 'compose', 'version'], root, True)
     path, values, created_key = prepare(root, args.public_url, args.jellyfin_host, not args.non_interactive)
+    from live_setup import prepare_live
+    try:
+        prepare_live(root)
+    except ValueError as error:
+        raise DeployError(str(error)) from None
     set_permissions(path)
+    set_permissions(root / 'config' / 'mediamtx.yml')
     print('配置已准备：config/.env（重复运行保留已有配置与密钥）', flush=True)
     if created_key:
         print('首次生成的管理密钥（请保存，不要发布）：' + values['ADMIN_TOKEN'], flush=True)
     if args.init_only:
-        print('初始化完成；可执行 docker compose up -d --build 启动。')
+        print('初始化完成；可执行 bash compose.sh up -d --build 启动。')
         return
     command(['docker', 'compose', 'up', '-d', '--build'], root)
     wait_healthy(root)
+    live_check = '''import json, os, time, urllib.request
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+for attempt in range(15):
+    req = urllib.request.Request('http://127.0.0.1:8080/api/live', headers={'Authorization': 'Bearer ' + os.environ['ADMIN_TOKEN']})
+    with opener.open(req, timeout=3) as response:
+        state = json.load(response)
+    if state['enabled'] and state['gateway'] and state['online']:
+        break
+    time.sleep(1)
+else:
+    raise SystemExit('Live engine unavailable; inspect relay and mediamtx logs')
+'''
+    command(['docker', 'compose', 'exec', '-T', 'relay', 'python', '-c', live_check], root, True)
     print('容器启动成功，健康检查通过。')
     print('管理入口：' + values['PUBLIC_BASE_URL'])
     print('请按 README 配置 HTTPS 反向代理；18080 仅绑定本机，不会自动配置 DNS、证书或防火墙。')
+    print('直播引擎已连接。请放行 config/.env 中 LIVE_RTMP_PORT / LIVE_RTSP_PORT 对应的 TCP 端口（默认 1935 / 8554）。')
     if not created_key:
         print('继续使用原管理密钥；如需查看：sudo grep "^ADMIN_TOKEN=" config/.env')
 

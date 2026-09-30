@@ -10,7 +10,7 @@
   if (document.body.classList.contains('dashboard-page')) {
     const nav = document.createElement('nav');
     nav.className = 'app-nav'; nav.setAttribute('aria-label', '管理导航');
-    for (const [icon, label, href] of [['overview','概览','#stats'],['add','添加视频','#create-section'],['library','放映列表','#library-heading'],['settings','设置','#settings']]) {
+    for (const [icon, label, href] of [['overview','概览','#stats'],['library','视频点播','#library-heading'],['add','直播管理','#live'],['settings','设置','#settings']]) {
       const a = document.createElement('a'); a.href = href;
       a.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">${icons[icon]}</svg>`;
       a.append(document.createTextNode(label));

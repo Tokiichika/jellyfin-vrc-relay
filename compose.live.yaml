@@ -1,0 +1,30 @@
+# Included by install.sh / compose.sh. MediaMTX API and RTSP stay private.
+services:
+  relay:
+    ports:
+      - "${LIVE_RTSP_PORT:-8554}:8554"
+    environment:
+      LIVE_ENABLED: "true"
+      LIVE_MTX_API: http://mediamtx:9997
+      LIVE_MTX_RTSP_HOST: mediamtx
+      LIVE_MTX_RTSP_PORT: "8554"
+    pids_limit: 256
+  mediamtx:
+    image: bluenviron/mediamtx:1.21.1
+    user: "10001:10001"
+    restart: unless-stopped
+    ports:
+      - "${LIVE_RTMP_PORT:-1935}:1935"
+    volumes:
+      - ./config/mediamtx.yml:/mediamtx.yml:ro
+    read_only: true
+    mem_limit: 192m
+    cpus: 0.5
+    pids_limit: 128
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"

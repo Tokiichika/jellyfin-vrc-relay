@@ -15,6 +15,9 @@ class SettingsError(ValueError):
 
 # key: (label, default, constraint, group). Strings with tuple constraints are enums.
 SCHEMA = {
+    'LIVE_TOTAL_MBPS': ('直播独立总带宽（Mbps）', 100, (10, 10000), '直播带宽'),
+    'LIVE_UTILIZATION': ('直播可用带宽比例（%）', 80, (1, 100), '直播带宽'),
+    'LIVE_CLIENT_MBPS': ('直播单 IP 上限（Mbps，0 为均分）', 16, (0, 10000), '直播带宽'),
     'CACHE_MAX_BYTES': ('媒体缓存上限（GB）', 9000000000, (65536, 10000000000000), '缓存'),
     'REFRESH_SECONDS': ('统计刷新间隔（秒）', 3, (1, 60), '页面'),
     'FOOTER_ICP': ('ICP备案号', '', 100, '页面'),
@@ -26,7 +29,8 @@ SCHEMA = {
     'DEFAULT_HEIGHT': ('默认分辨率上限', 1080, (720, 1080, 2160), '播放默认值'),
     'DEFAULT_VIDEO_BITRATE': ('默认视频码率（bps）', 8000000, (500000, 20000000), '播放默认值'),
     'DEFAULT_AUDIO_BITRATE': ('默认 AAC 码率（bps）', 192000, (64000, 512000), '播放默认值'),
-    'DEFAULT_TRANSCODE_VIDEO': ('默认转为 H.264', True, None, '播放默认值'),
+    'DEFAULT_TRANSCODE_VIDEO': ('默认重新编码视频', True, None, '播放默认值'),
+    'DEFAULT_VIDEO_CODEC': ('默认视频编码', 'h264', ('h264', 'hevc'), '播放默认值'),
     'DEFAULT_TRANSCODE_AUDIO': ('默认转为 AAC', True, None, '播放默认值'),
     'DEFAULT_PRELOAD_PERCENT': ('默认开头预载比例（%）', 5, (1, 100), '播放默认值'),
     'HLS_TIMEOUT_SECONDS': ('NAS 分片请求超时（秒）', 90, (10, 300), 'NAS 请求'),
@@ -118,6 +122,8 @@ class Settings:
                 raise SettingsError(label + '的值无效')
         if values['BANDWIDTH_TOTAL_MBPS'] * values['BANDWIDTH_UTILIZATION'] / 100 < 10 or 0 < values['BANDWIDTH_CLIENT_MBPS'] < 10:
             raise SettingsError('带宽不能低于每 IP 10 Mbps；单 IP 上限可设为 0 表示均分')
+        if values['LIVE_TOTAL_MBPS'] * values['LIVE_UTILIZATION'] / 100 < 10 or 0 < values['LIVE_CLIENT_MBPS'] < 10:
+            raise SettingsError('直播带宽不能低于每 IP 10 Mbps；单 IP 上限可设为 0')
         if any(v not in ('h264', 'hevc', 'mpeg2video', 'mpeg4', 'vc1', 'vp8', 'vp9', 'av1') for v in values['NAS_DECODING_CODECS'].split(',') if v):
             raise SettingsError('硬解编码列表无效，请使用逗号分隔的编码名称')
 

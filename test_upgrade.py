@@ -67,7 +67,7 @@ class UpgradeTests(unittest.TestCase):
         self.assertIn('2.5.1', (backup / 'app.py').read_text())
 
     def test_unrecognized_conflicting_and_comment_only_versions_rejected(self):
-        for code in ['# version="2.6.0"', 'VERSION="2.9.0"',
+        for code in ['# version="2.6.0"', 'VERSION="3.0.0"',
                      'VERSION="2.5.0"', 'VERSION="2.6.0"\ndata={"version":"2.5.1"}']:
             with self.subTest(code=code):
                 (self.target / 'app.py').write_text(code, encoding='utf-8')
